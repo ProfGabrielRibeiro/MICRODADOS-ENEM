@@ -22,12 +22,19 @@ plugar os dados reais.
 """
 
 import glob
+import io
+import json
 import os
 import re
 
 import pandas as pd
 import plotly.express as px
+import requests
 import streamlit as st
+
+from correcao import corrigir, questoes_da_area, selecionar_questoes_reforco
+from gerar_pdf_reforco import gerar_pdf
+from interface_gabarito import tela_gabarito
 
 # ------------------------------------------------------------------
 # Configuração da página
@@ -41,6 +48,28 @@ st.set_page_config(
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "dados")
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "logo_fenix.png")
+MANIFEST_PATH = os.path.join(os.path.dirname(__file__), "manifest.json")
+
+
+@st.cache_data(show_spinner="Carregando índice do banco de questões...")
+def carregar_manifest():
+    """Lê o manifest.json do banco de questões (imagens hospedadas no R2).
+    Se o arquivo não existir ainda no repositório, a funcionalidade de
+    correção fica desabilitada, mas o resto do app continua funcionando
+    normalmente."""
+    if not os.path.exists(MANIFEST_PATH):
+        return []
+    with open(MANIFEST_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+@st.cache_data(show_spinner=False)
+def baixar_imagem_questao(image_url):
+    """Baixa e cacheia os bytes de uma imagem de questão hospedada no R2."""
+    resp = requests.get(image_url, timeout=15)
+    resp.raise_for_status()
+    return resp.content
+
 
 # Cores extraídas da identidade visual da Fênix Vestibulares (botões e logo do site oficial)
 FENIX_AZUL = "#39A2DB"
@@ -243,6 +272,26 @@ _garantir_tema_claro()
 # quantidade de cores e o desempate por "mais cadernos" escolheu o
 # grupo errado).
 GRUPOS_VALIDADOS = {
+    (2015, "LC"): [239, 240, 241, 242],
+    (2015, "CH"): [231, 232, 233, 234, 251],
+    (2015, "CN"): [235, 236, 237, 238],
+    (2015, "MT"): [243, 244, 245, 246],
+    (2016, "LC"): [299, 300, 301, 302, 309],
+    (2016, "CH"): [295, 296, 297, 298, 308],
+    (2016, "CN"): [291, 292, 293, 294],
+    (2016, "MT"): [303, 304, 305, 306],
+    (2017, "LC"): [399, 400, 401, 402, 409],
+    (2017, "CH"): [395, 396, 397, 398, 408],
+    (2017, "CN"): [391, 392, 393, 394],
+    (2017, "MT"): [403, 404, 405, 406],
+    (2018, "LC"): [455, 456, 457, 458, 465, 469],
+    (2018, "CH"): [451, 452, 453, 454, 468],
+    (2018, "CN"): [447, 448, 449, 450, 467],
+    (2018, "MT"): [459, 460, 461, 462],
+    (2019, "LC"): [511, 512, 513, 514, 521, 525],
+    (2019, "CH"): [507, 508, 509, 510, 520, 524],
+    (2019, "CN"): [503, 504, 505, 506, 523],
+    (2019, "MT"): [515, 516, 517, 518, 526],
     (2020, "LC"): [577, 578, 579, 580, 583, 584, 585],
     (2020, "CH"): [567, 568, 569, 570, 573, 574, 575],
     (2020, "CN"): [597, 598, 599, 600],
@@ -321,17 +370,19 @@ def carregar_dados_reais(arquivos_enviados=None) -> pd.DataFrame:
         dados["SG_AREA"] = dados["SG_AREA"].astype(str).str.upper().str.strip()
         dados = dados[dados["SG_AREA"].isin(MATRIZES.keys())]
 
+    if "TX_COR" in dados.columns:
+        dados["TX_COR"] = dados["TX_COR"].astype(str).str.upper().str.strip()
+
     dados = _classificar_aplicacoes(dados)
     return tratar_dados(dados)
 
 
 def _classificar_aplicacoes(dados: pd.DataFrame) -> pd.DataFrame:
     """Para cada combinação (ano, área), usa o grupo de CO_PROVA já
-    validado manualmente (GRUPOS_VALIDADOS) para a aplicação Regular.
-    O grupo PPL/Reaplicação é identificado por heurística (o conjunto
-    remanescente com mais cores/cadernos distintos) — como ainda não
-    temos gabarito oficial de PPL pra validar, essa parte é uma
-    aproximação, diferente da Regular que é 100% conferida."""
+    validado manualmente (GRUPOS_VALIDADOS) contra o gabarito oficial
+    para identificar a aplicação Regular. Todos os demais grupos (PPL,
+    reaplicação, digital, adaptada etc.) são descartados — o app
+    trabalha só com a aplicação Regular, que é 100% conferida."""
     chaves = {"NU_ANO", "SG_AREA", "CO_ITEM", "CO_PROVA"}
     if not chaves.issubset(dados.columns):
         dados = dados.copy()
@@ -344,40 +395,29 @@ def _classificar_aplicacoes(dados: pd.DataFrame) -> pd.DataFrame:
     for (ano, area), bloco in dados.groupby(["NU_ANO", "SG_AREA"]):
         rotulos = {}
 
-        grupos_por_prova = bloco.groupby("CO_PROVA")["CO_ITEM"].apply(lambda s: frozenset(s))
-        conjuntos = set(grupos_por_prova.values)
-
-        ranking = []
-        for conjunto in conjuntos:
-            provas_do_conjunto = [p for p, s in grupos_por_prova.items() if s == conjunto]
-            n_cores = bloco[bloco["CO_PROVA"].isin(provas_do_conjunto)]["TX_COR"].nunique()
-            ranking.append((n_cores, len(provas_do_conjunto), conjunto, provas_do_conjunto))
-        ranking.sort(key=lambda t: (t[0], t[1]), reverse=True)
-
         chave_validada = GRUPOS_VALIDADOS.get((int(ano), area))
         if chave_validada is not None:
             # usa o grupo confirmado manualmente contra o gabarito oficial
             provas_presentes = set(bloco["CO_PROVA"].unique())
             provas_regular = [p for p in chave_validada if p in provas_presentes]
         else:
+            grupos_por_prova = bloco.groupby("CO_PROVA")["CO_ITEM"].apply(lambda s: frozenset(s))
+            conjuntos = set(grupos_por_prova.values)
+            ranking = []
+            for conjunto in conjuntos:
+                provas_do_conjunto = [p for p, s in grupos_por_prova.items() if s == conjunto]
+                n_cores = bloco[bloco["CO_PROVA"].isin(provas_do_conjunto)]["TX_COR"].nunique()
+                ranking.append((n_cores, len(provas_do_conjunto), conjunto, provas_do_conjunto))
+            ranking.sort(key=lambda t: (t[0], t[1]), reverse=True)
             provas_regular = ranking[0][3] if ranking else []
 
         for prova in provas_regular:
             rotulos[prova] = "Regular"
 
-        # PPL/Reaplicação: maior grupo restante que não seja o Regular (heurística)
-        provas_regular_set = set(provas_regular)
-        for _, _, _, provas_do_conjunto in ranking:
-            if set(provas_do_conjunto) & provas_regular_set:
-                continue
-            for prova in provas_do_conjunto:
-                rotulos[prova] = "PPL/Reaplicação"
-            break
-
         indices = dados.index[(dados["NU_ANO"] == ano) & (dados["SG_AREA"] == area)]
         dados.loc[indices, "APLICACAO"] = dados.loc[indices, "CO_PROVA"].map(rotulos)
 
-    # descarta grupos além de Regular e PPL/Reaplicação (versões digitais/adaptadas extras)
+    # mantém só a aplicação Regular (descarta PPL/reaplicação/digital/adaptada)
     dados = dados[dados["APLICACAO"].notna()]
     dados = dados.drop_duplicates(subset=["NU_ANO", "SG_AREA", "CO_ITEM", "APLICACAO", "TX_COR"])
     return dados
@@ -495,25 +535,12 @@ if usando_exemplo:
     )
 
 # ------------------------------------------------------------------
-# Controles — Ano / Aplicação / Prova
+# Controles — Edição / Áreas do conhecimento
 # ------------------------------------------------------------------
 anos_disponiveis = sorted(dados["NU_ANO"].dropna().unique().tolist(), reverse=True) if "NU_ANO" in dados.columns else []
 
 st.markdown("**Edição**")
 ano_selecionado = st.selectbox("Edição", options=anos_disponiveis, label_visibility="collapsed")
-
-st.markdown("**Aplicação**")
-aplicacao_selecionada = st.radio(
-    "Aplicação",
-    options=["Regular", "PPL/Reaplicação"],
-    horizontal=True,
-    label_visibility="collapsed",
-)
-if aplicacao_selecionada == "PPL/Reaplicação":
-    st.caption(
-        "⚠️ A separação de PPL/Reaplicação ainda é uma aproximação (sem gabarito oficial "
-        "para validar) — pode conter imprecisões, diferente da aplicação Regular, que é 100% conferida."
-    )
 
 st.markdown("**Áreas do conhecimento**")
 areas_no_ano = dados.loc[dados["NU_ANO"] == ano_selecionado, "SG_AREA"].unique().tolist() if ano_selecionado is not None else []
@@ -527,18 +554,18 @@ area_selecionada = st.radio(
 )
 
 # ------------------------------------------------------------------
-# Filtragem
+# Filtragem — sempre a aplicação Regular
 # ------------------------------------------------------------------
 filtrado = dados[
     (dados["NU_ANO"] == ano_selecionado)
-    & (dados["APLICACAO"] == aplicacao_selecionada)
+    & (dados["APLICACAO"] == "Regular")
     & (dados["SG_AREA"] == area_selecionada)
 ].copy()
 
 if filtrado.empty:
     st.info(
         f"Não há dados para {MATRIZES.get(area_selecionada, {}).get('nome', area_selecionada)} "
-        f"· {ano_selecionado} · {aplicacao_selecionada}. Tente outra combinação."
+        f"· {ano_selecionado}. Tente outra combinação."
     )
 else:
     cores_disponiveis = sorted(filtrado["TX_COR"].dropna().unique().tolist()) if "TX_COR" in filtrado.columns else []
@@ -580,7 +607,6 @@ else:
         "HABILIDADE_LABEL": "Habilidade",
         "COMPETENCIA": "Competência",
         "TX_GABARITO": "Gabarito",
-        "NIVEL_DIFICULDADE": "Dificuldade",
     }
     colunas_presentes = [c for c in colunas_exibir if c in filtrado.columns]
 
@@ -594,7 +620,7 @@ else:
     st.download_button(
         "⬇️ Baixar esta prova em CSV",
         data=csv_export,
-        file_name=f"enem_{ano_selecionado}_{area_selecionada}_{aplicacao_selecionada.replace('/', '-')}.csv",
+        file_name=f"enem_{ano_selecionado}_{area_selecionada}_regular.csv",
         mime="text/csv",
     )
 
@@ -604,6 +630,72 @@ else:
         + " · fonte: microdados do ENEM (INEP) · "
         "https://www.gov.br/inep/pt-br/acesso-a-informacao/dados-abertos/microdados/enem"
     )
+
+    # ------------------------------------------------------------------
+    # Praticar e corrigir gabarito (Parte 2 do roadmap)
+    # ------------------------------------------------------------------
+    st.divider()
+    manifest = carregar_manifest()
+    lingua_manifest = {"Inglês": "ING", "Espanhol": "ESP"}.get(idioma_selecionado)
+
+    if not manifest:
+        st.info(
+            "📄 O banco de imagens das questões ainda não está configurado neste "
+            "app (arquivo `manifest.json` não encontrado). A correção automática "
+            "de gabarito fica disponível assim que ele for adicionado ao repositório."
+        )
+    else:
+        entradas_area = questoes_da_area(
+            manifest, int(ano_selecionado), area_selecionada, lingua=lingua_manifest
+        )
+        if not entradas_area:
+            st.info(
+                f"Ainda não temos as imagens de {MATRIZES[area_selecionada]['nome']} · "
+                f"{ano_selecionado} no banco — a correção automática fica disponível "
+                "assim que essa edição for adicionada."
+            )
+        elif st.checkbox("✍️ Praticar e corrigir meu gabarito"):
+            respostas, enviado = tela_gabarito(
+                entradas_area, lingua=lingua_manifest,
+                key_prefix=f"gab_{ano_selecionado}_{area_selecionada}_{lingua_manifest or ''}",
+            )
+            if enviado:
+                resultado = corrigir(
+                    manifest, int(ano_selecionado), area_selecionada, respostas,
+                    lingua=lingua_manifest,
+                )
+                pct = (resultado["acertos"] / resultado["total"] * 100) if resultado["total"] else 0
+                st.success(f"Você acertou **{resultado['acertos']} de {resultado['total']}** questões ({pct:.0f}%).")
+
+                if resultado["habilidades_erradas"]:
+                    st.markdown("**Habilidades a reforçar:**")
+                    for h in resultado["habilidades_erradas"]:
+                        st.markdown(f"- `{h['habilidade']}` · {h['competencia']} — {h['erros']}/{h['total']} erro(s)")
+
+                    with st.spinner("Montando seu PDF de reforço..."):
+                        blocos = selecionar_questoes_reforco(
+                            manifest, resultado["habilidades_erradas"],
+                            ano_excluir=int(ano_selecionado), lingua=lingua_manifest,
+                        )
+                        pdf_bytes = gerar_pdf(
+                            resultado_correcao=resultado,
+                            blocos_reforco=blocos,
+                            carregar_imagem=lambda e: baixar_imagem_questao(e["image_url"]),
+                            edicao_label=(
+                                f"ENEM {ano_selecionado} · {MATRIZES[area_selecionada]['nome']}"
+                                + (f" · {idioma_selecionado}" if idioma_selecionado else "")
+                            ),
+                            logo_path=LOGO_PATH if os.path.exists(LOGO_PATH) else None,
+                        )
+                    st.download_button(
+                        "⬇️ Baixar PDF de reforço",
+                        data=pdf_bytes,
+                        file_name=f"reforco_{ano_selecionado}_{area_selecionada}.pdf",
+                        mime="application/pdf",
+                    )
+                else:
+                    st.balloons()
+                    st.markdown("Você não errou nenhuma questão associada a uma habilidade específica. 🎉")
 
     # ------------------------------------------------------------------
     # Gráficos de incidência das habilidades
@@ -631,7 +723,7 @@ else:
     st.markdown(f"#### 📊 Incidência das habilidades — {MATRIZES[area_selecionada]['nome']}")
 
     # --- Gráfico 1: só o ano selecionado (mesmos filtros da tabela) ---
-    st.markdown(f"**Ano {int(ano_selecionado)}** ({aplicacao_selecionada})")
+    st.markdown(f"**Ano {int(ano_selecionado)}**")
     fig_ano = _grafico_incidencia(filtrado)
     if fig_ano is not None:
         st.plotly_chart(fig_ano, use_container_width=True)

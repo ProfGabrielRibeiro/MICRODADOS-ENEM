@@ -23,20 +23,42 @@ Uso típico dentro do app.py:
 import streamlit as st
 
 LETRAS = ["A", "B", "C", "D", "E"]
-N_COLUNAS = 3  # quantas questões lado a lado -- ajuste conforme o espaço
+N_COLUNAS = 5  # mais colunas = grade mais compacta
+
+_CSS_GRADE_COMPACTA = """
+<style>
+.st-key-grade_gabarito div[role="radiogroup"] {
+    gap: 4px;
+}
+.st-key-grade_gabarito div[role="radiogroup"] label {
+    padding: 3px 8px !important;
+    border-radius: 6px !important;
+    border-width: 1.5px !important;
+}
+.st-key-grade_gabarito div[role="radiogroup"] label p {
+    font-size: 0.8rem !important;
+}
+.st-key-grade_gabarito [data-testid="stWidgetLabel"] p {
+    font-size: 0.82rem !important;
+    font-weight: 600 !important;
+    margin-bottom: 2px !important;
+}
+</style>
+"""
 
 
 def tela_gabarito(entradas_caderno, lingua=None, key_prefix="gabarito"):
     """
     entradas_caderno: lista de entradas do manifest para o caderno
                        (já filtradas pela língua, se aplicável --
-                       veja correcao.questoes_do_caderno)
+                       veja correcao.questoes_da_area)
 
     Retorna (respostas, enviado):
       respostas: dict {questao_caderno: "A".."E"} com o que foi
                  preenchido até agora (mesmo antes de enviar)
       enviado: True só no momento em que o aluno clica em Corrigir
     """
+    st.markdown(_CSS_GRADE_COMPACTA, unsafe_allow_html=True)
     st.markdown("### Gabarito")
     st.caption(
         "Marque a alternativa escolhida em cada questão e clique em "
@@ -45,20 +67,21 @@ def tela_gabarito(entradas_caderno, lingua=None, key_prefix="gabarito"):
 
     respostas = {}
     with st.form(key=f"{key_prefix}_form"):
-        colunas = st.columns(N_COLUNAS)
-        for i, entrada in enumerate(entradas_caderno):
-            q = entrada["questao_caderno"]
-            col = colunas[i % N_COLUNAS]
-            with col:
-                escolha = st.radio(
-                    f"Questão {q}",
-                    LETRAS,
-                    index=None,
-                    horizontal=True,
-                    key=f"{key_prefix}_{q}_{lingua or ''}",
-                )
-                if escolha:
-                    respostas[q] = escolha
+        with st.container(key="grade_gabarito"):
+            colunas = st.columns(N_COLUNAS)
+            for i, entrada in enumerate(entradas_caderno):
+                q = entrada["questao_caderno"]
+                col = colunas[i % N_COLUNAS]
+                with col:
+                    escolha = st.radio(
+                        f"Q{q}",
+                        LETRAS,
+                        index=None,
+                        horizontal=True,
+                        key=f"{key_prefix}_{q}_{lingua or ''}",
+                    )
+                    if escolha:
+                        respostas[q] = escolha
 
         st.markdown("")  # respiro antes do botão
         enviado = st.form_submit_button("Corrigir")
